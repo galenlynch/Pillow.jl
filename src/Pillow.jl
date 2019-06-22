@@ -1,10 +1,10 @@
 module Pillow
 
+export TiffStack
+
 using PyCall
 
 import Base: size, getindex, setindex!, IndexStyle, @propagate_inbounds
-
-export TiffStack
 
 const MODE_BITSTYPE_LOOKUP = Dict(
     "I;16" => (UInt16, 3),
