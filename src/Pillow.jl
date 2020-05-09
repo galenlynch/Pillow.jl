@@ -65,9 +65,9 @@ function load_frame(o::PyObject, pageno::Integer)
     pycall(NP.array, PyArray, o)
 end
 
-function load_frame!(t::TiffStack{T, 3}, pageno::Integer) where T
+function load_frame!(t::TiffStack{T, <:Any, N}, pageno::Integer) where {T, N}
     t.current_pageno = pageno
-    t.current_page = load_frame(t.img, pageno)::PyArray{T, 2}
+    t.current_page = load_frame(t.img, pageno)::PyArray{T, N}
 end
 
 IndexStyle(::Type{<:TiffStack}) = IndexCartesian()
@@ -75,13 +75,13 @@ IndexStyle(::Type{<:TiffStack}) = IndexCartesian()
 size(t::TiffStack) = t.dims
 
 @inline @propagate_inbounds function getindex(
-    t::TiffStack{<:Any, 3, 2}, i::Vararg{<:Integer, 3}
-)
-    @boundscheck checkbounds(t, i...)
-    if t.current_pageno != i[3]
-        load_frame!(t, i[3])
+    t::TiffStack{<:Any, M, <:Any}, i::Vararg{<:Integer, M}
+) where M
+    @boundscheck checkbounds(t, CartesianIndex(i))
+    if i[end] != t.current_pageno
+        load_frame!(t, i[end])
     end
-    t.current_page[i[2], i[1]]
+    t.current_page[CartesianIndex(reverse(i[1:end - 1]))]
 end
 
 setindex!(::TiffStack, ::Any, ::Any...) = throw(ReadOnlyMemoryError())
