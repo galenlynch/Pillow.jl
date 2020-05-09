@@ -1,0 +1,12 @@
+name = "Pillow"
+uuid = "ae4a1b0c-2eba-53ea-bfa1-4b204b1b4ec7"
+authors = ["Galen Lynch <galen.lynch@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+PyCall = "438e738f-606a-5dbb-bf0a-cddfbfd45ab0"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[compat]
+PyCall = "1"
+julia = "0.7 - 1"
