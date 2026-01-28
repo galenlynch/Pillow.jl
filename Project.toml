@@ -1,6 +1,6 @@
 name = "Pillow"
 uuid = "ae4a1b0c-2eba-53ea-bfa1-4b204b1b4ec7"
-authors = ["Galen Lynch <galen.lynch@gmail.com>"]
+authors = ["Galen Lynch <galen@galenlynch.com>"]
 version = "0.1.0"
 
 [deps]
