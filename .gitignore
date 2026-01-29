@@ -1,6 +1,17 @@
+.julia/
 *.jl.*.cov
 *.jl.cov
 *.jl.mem
 /Manifest*.toml
 /docs/Manifest*.toml
 /docs/build/
+
+CondaPkg.lock
+.CondaPkg/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+
+.vscode/
+.DS_Store
