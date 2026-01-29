@@ -1,87 +1,198 @@
 module Pillow
 
-export TiffStack
+export TiffStack, frame
 
-using PyCall
 
-import Base: size, getindex, setindex!, IndexStyle, @propagate_inbounds
+using PythonCall: Py, PyArray, pybuiltins, pyconvert, pyimport, pynew, pycopy!
+import Base: close, size, getindex, setindex!, IndexStyle
+using Base: front, @propagate_inbounds
 
-const MODE_BITSTYPE_LOOKUP = Dict(
-    "I;16" => (UInt16, 3),
-    "L" => (UInt8, 3),
-    "RGB" => (UInt8, 4)
+# Pillow image mode -> (Julia eltype, stack ndims, NumPy dtype attribute symbol)
+# Stack ndims here refers to the exposed array dimensionality:
+#   ndims==3  => (nx, ny, nf)
+#   ndims==4  => (nc, nx, ny, nf)
+const MODE_INFO = Dict(
+    "I;16" => (UInt16, 3, :uint16),
+    "L"    => (UInt8,  3, :uint8),
+    "RGB"  => (UInt8,  4, :uint8),
 )
 
-const PIM = PyNULL() # PIL.Image
-const NP = PyNULL() # numpy
+const PIM = pynew()  # PIL.Image module
+const NP  = pynew()  # numpy module
 
 function __init__()
-    copy!(PIM, pyimport("PIL.Image"))
-    copy!(NP, pyimport("numpy"))
+    pycopy!(PIM ,pyimport("PIL.Image"))
+    pycopy!(NP, pyimport("numpy"))
 end
 
-mutable struct TiffStack{T, M, N} <: AbstractArray{T, M}
-    img::PyObject
-    current_page::PyArray{T, N}
-    current_pageno::Int
-    dims::NTuple{M, Int}
+"""
+    TiffStack(path::AbstractString)
+    TiffStack(img::Py)
 
-    function TiffStack{T, M, N}(img::PyObject, dims::NTuple{M, Int}) where {T, M, N}
-        N == M - 1 || throw(ArgumentError("Invalid dimensions"))
-        all(dims .>= 0) || throw(ArgumentError("Invalid size"))
-        dims[end] > 0 || throw(ArgumentError("Must have at least one frame"))
-        current_page = load_frame(img, 1)::PyArray{T, N}
-        new(img, current_page, 1, dims)
-    end
-end
+Read-only cached view of a multi-frame TIFF backed by Pillow + NumPy.
 
-function TiffStack{T, 3}(img::PyObject, nx, ny, nf) where T
-    TiffStack{T, 3, 2}(img, (nx, ny, nf))
-end
+Axis semantics (kept compatible with the original PyCall version):
+- Grayscale: `size(t) == (nx, ny, nf)` and indexing `t[x, y, k]`
+- RGB:       `size(t) == (nc, nx, ny, nf)` and indexing `t[c, x, y, k]`
 
-function TiffStack{T, 4}(img::PyObject, nx, ny, nf) where T
-    nc = length(img.getbands())::Int
-    TiffStack{T, 4, 3}(img, (nc, nx, ny, nf))
-end
-
-function TiffStack{T, N}(img::PyObject) where {T, N}
-    nx, ny = img.size::NTuple{2, Int}
-    nf = img.n_frames::Int
-    TiffStack{T, N}(img, nx, ny, nf)
-end
-
-TiffStack{T, N}(pathname::AbstractString) where {T, N} =
-    TiffStack{T, N}(PIM.open(pathname)::PyObject)
-
-function TiffStack(img::PyObject)
-    elt, nd = MODE_BITSTYPE_LOOKUP[img.mode::String]
-    TiffStack{elt, nd}(img)
-end
-
-TiffStack(pathname::AbstractString) = TiffStack(PIM.open(pathname)::PyObject)
-
-function load_frame(o::PyObject, pageno::Integer)
-    o.seek(pageno - 1)
-    pycall(NP.array, PyArray, o)
-end
-
-function load_frame!(t::TiffStack{T, <:Any, N}, pageno::Integer) where {T, N}
-    t.current_pageno = pageno
-    t.current_page = load_frame(t.img, pageno)::PyArray{T, N}
+Implementation notes:
+- Each frame is decoded to a NumPy array and then *transposed as a view* so that the
+  cached page matches the axis semantics above:
+    - grayscale: NumPy (ny, nx)    -> cached page (nx, ny) via transpose(1,0)
+    - RGB:      NumPy (ny,nx,nc)   -> cached page (nc,nx,ny) via transpose(2,1,0)
+- Only one page is cached at a time; changing the last index loads a new frame.
+"""
+mutable struct TiffStack{T, M, N, P<:AbstractArray{T, N}} <: AbstractArray{T, M}
+    img::Py
+    dtype::Py              # cached NumPy dtype object, e.g. np.uint8
+    current_page::P        # cached page in our axis order: (nx,ny) or (nc,nx,ny)
+    current_pageno::Int    # 1-based frame index
+    dims::NTuple{M, Int}   # (nx,ny,nf) or (nc,nx,ny,nf)
+    closed::Bool
 end
 
 IndexStyle(::Type{<:TiffStack}) = IndexCartesian()
-
 size(t::TiffStack) = t.dims
 
-@inline @propagate_inbounds function getindex(
-    t::TiffStack{<:Any, M, <:Any}, i::Vararg{<:Integer, M}
-) where M
-    @boundscheck checkbounds(t, CartesianIndex(i))
-    if i[end] != t.current_pageno
-        load_frame!(t, i[end])
+function close(t::TiffStack)
+    t.closed && return nothing # Exit early if already closed
+
+    try
+        if PythonCall.C.Py_IsInitialized() != 0
+            t.img.close()
+        end
+    catch ex
+        ex isa UndefVarError || rethrow()
+        # Module bindings may be torn down during atexit; nothing to do.
     end
-    t.current_page[CartesianIndex(reverse(i[1:end - 1]))]
+
+    t.closed = true
+    return nothing
+end
+
+function TiffStack(f::Function, pathname::AbstractString)
+    stack = TiffStack(pathname)
+    try
+        f(stack)
+    finally
+        close(stack)
+    end
+end
+
+# -----------------------
+# Internal: page loading
+# -----------------------
+@inline function _load_page(img::Py, pageno::Int, dtype::Py, ::Val{M}) where {M}
+    img.seek(pageno - 1)                   # Pillow uses 0-based frame indexing
+    a = NP.asarray(img, dtype=dtype)     # decode -> NumPy array (often allocates once)
+
+    if M == 3
+        # (ny,nx) -> (nx,ny)
+        return PyArray(a.transpose(1, 0))
+    elseif M == 4
+        # (ny,nx,nc) -> (nc,nx,ny)
+        return PyArray(a.transpose(2, 1, 0))
+    else
+        throw(ArgumentError("Unsupported stack dimensionality M=$M"))
+    end
+end
+
+@inline function _load_page!(t::TiffStack{T, M, N, P}, pageno::Int) where {T, M, N, P}
+    t.closed && error("TiffStack is already closed and cannot load new frames.")
+    t.current_pageno = pageno
+    t.current_page = _load_page(t.img, pageno, t.dtype, Val(M))::P
+    return t
+end
+
+# -----------------------
+# Public: frame accessor
+# -----------------------
+@inline frame(t::TiffStack, k::Integer) = _frame(t, Int(k))
+
+@inline @propagate_inbounds function _frame(t::TiffStack{<:Any, M}, k::Int) where {M}
+    # Frame index is always the last axis in this API.
+    @boundscheck checkbounds(t, ntuple(_ -> 1, M - 1)..., k)
+    if k != t.current_pageno
+        _load_page!(t, k)
+    end
+    return t.current_page
+end
+
+# -----------------------
+# Constructors
+# -----------------------
+TiffStack(pathname::AbstractString) = TiffStack(PIM.open(pathname))
+
+function TiffStack(img::Py)
+    mode = pyconvert(String, img.mode)
+    info = get(MODE_INFO, mode, nothing)
+    info === nothing && throw(ArgumentError("Unsupported Pillow mode: $(repr(mode))"))
+    elt, nd, dtypesym = info
+
+    dtype = getproperty(NP, dtypesym)
+
+    # PIL.Image.size is (nx, ny)
+    nx, ny = pyconvert(NTuple{2, Int}, img.size)
+    nf = pyconvert(Int, img.n_frames)
+    nf > 0 || throw(ArgumentError("Must have at least one frame"))
+
+    if nd == 3
+        dims = (nx, ny, nf)
+        page1 = _load_page(img, 1, dtype, Val(3))  # (nx, ny)
+        obj =  TiffStack{elt, 3, 2, typeof(page1)}(img, dtype, page1, 1, dims, false)
+    elseif nd == 4
+        nc = pyconvert(Int, pybuiltins.len(img.getbands()))
+        dims = (nc, nx, ny, nf)
+        page1 = _load_page(img, 1, dtype, Val(4))  # (nc, nx, ny)
+        obj = TiffStack{elt, 4, 3, typeof(page1)}(img, dtype, page1, 1, dims, false)
+    else
+        throw(ArgumentError("Unsupported nd=$nd for mode=$(repr(mode))"))
+    end
+
+    finalizer(close, obj)
+
+    return obj
+end
+
+# -----------------------
+# Indexing
+# -----------------------
+
+# (1) Fast scalar path: all Int indices
+@inline @propagate_inbounds function getindex(
+    t::TiffStack{<:Any, M}, i::Vararg{Int, M}
+) where {M}
+    @boundscheck checkbounds(t, i...)
+    k = i[M] # Access the last element directly via M
+    if k != t.current_pageno
+        _load_page!(t, k)
+    end
+    return t.current_page[front(i)...]
+end
+
+# (2) CartesianIndex forwarding
+@inline @propagate_inbounds function getindex(
+    t::TiffStack{<:Any, M}, I::CartesianIndex{M}
+) where {M}
+    return t[I.I...]
+end
+
+# (B) Single-frame slicing where the last index is an Int frame number:
+#     t[:, :, k] or t[:, :, :, k]
+@inline @propagate_inbounds function getindex(
+    t::TiffStack{<:Any, M},
+    inds::Vararg{Any, M},
+) where {M}
+    @boundscheck checkbounds(t, inds...)
+
+    k = inds[M]
+    k isa Int || throw(ArgumentError("Last index must be an Int frame number, got $(typeof(k))"))
+
+    if k != t.current_pageno
+        _load_page!(t, k)
+    end
+
+    return t.current_page[front(inds)...]
 end
 
 setindex!(::TiffStack, ::Any, ::Any...) = throw(ReadOnlyMemoryError())

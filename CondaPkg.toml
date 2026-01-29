@@ -1,0 +1,7 @@
+[deps]
+numpy = ">=1.10"
+pillow = ">=2.9"
+
+[deps.python]
+channel = "conda-forge"
+version = ">=3.10,<3.14" # PythonCall crashing on 3.14
