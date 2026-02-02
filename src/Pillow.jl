@@ -74,14 +74,14 @@ IndexStyle(::Type{<:TiffStack}) = IndexCartesian()
 
 size(t::TiffStack) = t.dims
 
-@inline @propagate_inbounds function getindex(
+@propagate_inbounds function getindex(
     t::TiffStack{<:Any, M, <:Any}, i::Vararg{<:Integer, M}
 ) where M
     @boundscheck checkbounds(t, CartesianIndex(i))
     if i[end] != t.current_pageno
         load_frame!(t, i[end])
     end
-    t.current_page[CartesianIndex(reverse(i[1:end - 1]))]
+    t.current_page[CartesianIndex(i[1:end - 1])]
 end
 
 setindex!(::TiffStack, ::Any, ::Any...) = throw(ReadOnlyMemoryError())
